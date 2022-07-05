@@ -10,7 +10,7 @@ import (
 // Voter records chits received from [vdr] once its dependencies are met.
 type voter struct {
 	t         *Transitive
-	vdr       ids.ShortID
+	vdr       ids.NodeID
 	requestID uint32
 	response  ids.ID
 	deps      ids.Set
@@ -113,7 +113,7 @@ votesLoop:
 		// reached the first ancestor of the original [vote] that has been
 		// issued consensus. In this case, the votes will be bubbled further
 		// from [blk] to any of its ancestors that are also in consensus.
-		for status.Fetched() && !v.t.Consensus.DecidedOrProcessing(blk) {
+		for status.Fetched() && !(v.t.Consensus.Decided(blk) || v.t.Consensus.Processing(blkID)) {
 			parentID := blk.Parent()
 			v.t.Ctx.Log.Verbo("Pushing %d vote(s) from %s (%s) to %s", count, blkID, status, parentID)
 
@@ -129,7 +129,7 @@ votesLoop:
 		}
 
 		// If [blkID] is currently in consensus, count the votes
-		if !status.Decided() && v.t.Consensus.DecidedOrProcessing(blk) {
+		if v.t.Consensus.Processing(blkID) {
 			v.t.Ctx.Log.Verbo("Applying %d vote(s) to %s (%s)", count, blkID, status)
 			bubbledVotes.AddCount(blkID, count)
 		} else {

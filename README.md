@@ -16,13 +16,13 @@ The minimum recommended hardware specification for nodes connected to Mainnet is
 
 - CPU: Equivalent of 8 AWS vCPU
 - RAM: 16 GiB
-- Storage: 512 GiB
+- Storage: 1TB 
 - OS: Ubuntu 18.04/20.04 or macOS >= 10.15 (Catalina)
 - Network: Reliable IPv4 or IPv6 network connection, with an open public port.
 
 If you plan to build AvalancheGo from source, you will also need the following software:
 
-- [Go](https://golang.org/doc/install) version >= 1.16.8
+- [Go](https://golang.org/doc/install) version >= 1.17.9
 - [gcc](https://gcc.gnu.org/)
 - g++
 
@@ -156,13 +156,13 @@ To regenerate the protobuf go code, run `scripts/protobuf_codegen.sh` from the r
 
 This should only be necessary when upgrading protobuf versions or modifying .proto definition files.
 
-To use this script, you must have [protoc](https://grpc.io/docs/protoc-installation/) (v3.17.3), protoc-gen-go (v1.26.0) and protoc-gen-go-grpc (v1.1.0) installed. protoc must be on your $PATH.
+To use this script, you must have [buf](https://docs.buf.build/installation) (v1.4.0), protoc-gen-go (v1.28.0) and protoc-gen-go-grpc (v1.2.0) installed.
 
-To install the protoc dependencies:
+To install the buf dependencies:
 
 ```sh
-go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.26
-go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.1
+go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.28.0
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.2.0
 ```
 
 If you have not already, you may need to add `$GOPATH/bin` to your `$PATH`:
@@ -171,10 +171,10 @@ If you have not already, you may need to add `$GOPATH/bin` to your `$PATH`:
 export PATH="$PATH:$(go env GOPATH)/bin"
 ```
 
-If you extract protoc to ~/software/protobuf/, the following should work:
+If you extract buf to ~/software/buf/bin, the following should work:
 
 ```sh
-export PATH=$PATH:~/software/protobuf/bin/:~/go/bin
+export PATH=$PATH:~/software/buf/bin/:~/go/bin
 go get google.golang.org/protobuf/cmd/protoc-gen-go
 go get google.golang.org/protobuf/cmd/protoc-gen-go-grpc
 scripts/protobuf_codegen.sh
@@ -185,7 +185,7 @@ For more information, refer to the [GRPC Golang Quick Start Guide](https://grpc.
 ### Running protobuf codegen from docker
 
 ```sh
-docker build -t avalanche:protobuf_codegen -f Dockerfile.protoc .
+docker build -t avalanche:protobuf_codegen -f api/Dockerfile.buf .
 docker run -t -i -v $(pwd):/opt/avalanche -w/opt/avalanche avalanche:protobuf_codegen bash -c "scripts/protobuf_codegen.sh"
 ```
 

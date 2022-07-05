@@ -14,10 +14,13 @@ type Config struct {
 	common.AllGetsServer
 
 	// Blocked tracks operations that are blocked on blocks
+	//
+	// It should be guaranteed that `MissingIDs` should contain all IDs
+	// referenced by the `MissingDependencies` that have not already been added
+	// to the queue.
 	Blocked *queue.JobsWithMissing
 
-	VM            block.ChainVM
-	WeightTracker common.WeightTracker
+	VM block.ChainVM
 
 	Bootstrapped func()
 }

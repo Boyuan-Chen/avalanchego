@@ -61,7 +61,6 @@ func NewNested(prefix []byte, db database.Database) *Database {
 	}
 }
 
-// Has implements the Database interface
 // Assumes that it is OK for the argument to db.db.Has
 // to be modified after db.db.Has returns
 // [key] may be modified after this method returns.
@@ -78,7 +77,6 @@ func (db *Database) Has(key []byte) (bool, error) {
 	return has, err
 }
 
-// Get implements the Database interface
 // Assumes that it is OK for the argument to db.db.Get
 // to be modified after db.db.Get returns.
 // [key] may be modified after this method returns.
@@ -95,7 +93,6 @@ func (db *Database) Get(key []byte) ([]byte, error) {
 	return val, err
 }
 
-// Put implements the Database interface
 // Assumes that it is OK for the argument to db.db.Put
 // to be modified after db.db.Put returns.
 // [key] can be modified after this method returns.
@@ -113,7 +110,6 @@ func (db *Database) Put(key, value []byte) error {
 	return err
 }
 
-// Delete implements the Database interface.
 // Assumes that it is OK for the argument to db.db.Delete
 // to be modified after db.db.Delete returns.
 // [key] may be modified after this method returns.
@@ -130,7 +126,6 @@ func (db *Database) Delete(key []byte) error {
 	return err
 }
 
-// NewBatch implements the Database interface
 func (db *Database) NewBatch() database.Batch {
 	return &batch{
 		Batch: db.db.NewBatch(),
@@ -138,22 +133,18 @@ func (db *Database) NewBatch() database.Batch {
 	}
 }
 
-// NewIterator implements the Database interface
 func (db *Database) NewIterator() database.Iterator {
 	return db.NewIteratorWithStartAndPrefix(nil, nil)
 }
 
-// NewIteratorWithStart implements the Database interface
 func (db *Database) NewIteratorWithStart(start []byte) database.Iterator {
 	return db.NewIteratorWithStartAndPrefix(start, nil)
 }
 
-// NewIteratorWithPrefix implements the Database interface
 func (db *Database) NewIteratorWithPrefix(prefix []byte) database.Iterator {
 	return db.NewIteratorWithStartAndPrefix(nil, prefix)
 }
 
-// NewIteratorWithStartAndPrefix implements the Database interface.
 // Assumes it is safe to modify the arguments to db.db.NewIteratorWithStartAndPrefix after it returns.
 // It is safe to modify [start] and [prefix] after this method returns.
 func (db *Database) NewIteratorWithStartAndPrefix(start, prefix []byte) database.Iterator {
@@ -174,18 +165,6 @@ func (db *Database) NewIteratorWithStartAndPrefix(start, prefix []byte) database
 	return it
 }
 
-// Stat implements the Database interface
-func (db *Database) Stat(stat string) (string, error) {
-	db.lock.RLock()
-	defer db.lock.RUnlock()
-
-	if db.db == nil {
-		return "", database.ErrClosed
-	}
-	return db.db.Stat(stat)
-}
-
-// Compact implements the Database interface
 func (db *Database) Compact(start, limit []byte) error {
 	db.lock.RLock()
 	defer db.lock.RUnlock()
@@ -196,7 +175,6 @@ func (db *Database) Compact(start, limit []byte) error {
 	return db.db.Compact(db.prefix(start), db.prefix(limit))
 }
 
-// Close implements the Database interface
 func (db *Database) Close() error {
 	db.lock.Lock()
 	defer db.lock.Unlock()
@@ -206,6 +184,23 @@ func (db *Database) Close() error {
 	}
 	db.db = nil
 	return nil
+}
+
+func (db *Database) isClosed() bool {
+	db.lock.RLock()
+	defer db.lock.RUnlock()
+
+	return db.db == nil
+}
+
+func (db *Database) HealthCheck() (interface{}, error) {
+	db.lock.RLock()
+	defer db.lock.RUnlock()
+
+	if db.db == nil {
+		return nil, database.ErrClosed
+	}
+	return db.db.HealthCheck()
 }
 
 // Return a copy of [key], prepended with this db's prefix.
@@ -246,7 +241,6 @@ type batch struct {
 	writes []keyValue
 }
 
-// Put implements the Batch interface
 // Assumes that it is OK for the argument to b.Batch.Put
 // to be modified after b.Batch.Put returns
 // [key] may be modified after this method returns.
@@ -257,7 +251,6 @@ func (b *batch) Put(key, value []byte) error {
 	return b.Batch.Put(prefixedKey, value)
 }
 
-// Delete implements the Batch interface
 // Assumes that it is OK for the argument to b.Batch.Delete
 // to be modified after b.Batch.Delete returns
 // [key] may be modified after this method returns.
@@ -321,13 +314,45 @@ func (b *batch) Replay(w database.KeyValueWriterDeleter) error {
 type iterator struct {
 	database.Iterator
 	db *Database
+
+	key, val []byte
+	err      error
 }
 
-// Key calls the inner iterators Key and strips the prefix
-func (it *iterator) Key() []byte {
-	key := it.Iterator.Key()
-	if prefixLen := len(it.db.dbPrefix); len(key) >= prefixLen {
-		return key[prefixLen:]
+// Next calls the inner iterators Next() function and strips the keys prefix
+func (it *iterator) Next() bool {
+	if it.db.isClosed() {
+		it.key = nil
+		it.val = nil
+		it.err = database.ErrClosed
+		return false
 	}
-	return key
+
+	hasNext := it.Iterator.Next()
+	if hasNext {
+		key := it.Iterator.Key()
+		if prefixLen := len(it.db.dbPrefix); len(key) >= prefixLen {
+			key = key[prefixLen:]
+		}
+		it.key = key
+		it.val = it.Iterator.Value()
+	} else {
+		it.key = nil
+		it.val = nil
+	}
+
+	return hasNext
+}
+
+func (it *iterator) Key() []byte { return it.key }
+
+func (it *iterator) Value() []byte { return it.val }
+
+// Error returns [database.ErrClosed] if the underlying db was closed
+// otherwise it returns the normal iterator error.
+func (it *iterator) Error() error {
+	if it.err != nil {
+		return it.err
+	}
+	return it.Iterator.Error()
 }

@@ -17,8 +17,7 @@ import (
 
 var (
 	errInitialize           = errors.New("unexpectedly called Initialize")
-	errBootstrapping        = errors.New("unexpectedly called Bootstrapping")
-	errBootstrapped         = errors.New("unexpectedly called Bootstrapped")
+	errSetState             = errors.New("unexpectedly called SetState")
 	errShutdown             = errors.New("unexpectedly called Shutdown")
 	errCreateHandlers       = errors.New("unexpectedly called CreateHandlers")
 	errCreateStaticHandlers = errors.New("unexpectedly called CreateStaticHandlers")
@@ -38,29 +37,29 @@ var (
 type TestVM struct {
 	T *testing.T
 
-	CantInitialize, CantBootstrapping, CantBootstrapped,
+	CantInitialize, CantSetState,
 	CantShutdown, CantCreateHandlers, CantCreateStaticHandlers,
 	CantHealthCheck, CantConnected, CantDisconnected, CantVersion,
 	CantAppRequest, CantAppResponse, CantAppGossip, CantAppRequestFailed bool
 
-	InitializeF                              func(*snow.Context, manager.Manager, []byte, []byte, []byte, chan<- Message, []*Fx, AppSender) error
-	BootstrappingF, BootstrappedF, ShutdownF func() error
-	CreateHandlersF                          func() (map[string]*HTTPHandler, error)
-	CreateStaticHandlersF                    func() (map[string]*HTTPHandler, error)
-	ConnectedF                               func(nodeID ids.ShortID, nodeVersion version.Application) error
-	DisconnectedF                            func(nodeID ids.ShortID) error
-	HealthCheckF                             func() (interface{}, error)
-	AppRequestF                              func(nodeID ids.ShortID, requestID uint32, deadline time.Time, msg []byte) error
-	AppResponseF                             func(nodeID ids.ShortID, requestID uint32, msg []byte) error
-	AppGossipF                               func(nodeID ids.ShortID, msg []byte) error
-	AppRequestFailedF                        func(nodeID ids.ShortID, requestID uint32) error
-	VersionF                                 func() (string, error)
+	InitializeF           func(*snow.Context, manager.Manager, []byte, []byte, []byte, chan<- Message, []*Fx, AppSender) error
+	SetStateF             func(snow.State) error
+	ShutdownF             func() error
+	CreateHandlersF       func() (map[string]*HTTPHandler, error)
+	CreateStaticHandlersF func() (map[string]*HTTPHandler, error)
+	ConnectedF            func(nodeID ids.NodeID, nodeVersion *version.Application) error
+	DisconnectedF         func(nodeID ids.NodeID) error
+	HealthCheckF          func() (interface{}, error)
+	AppRequestF           func(nodeID ids.NodeID, requestID uint32, deadline time.Time, msg []byte) error
+	AppResponseF          func(nodeID ids.NodeID, requestID uint32, msg []byte) error
+	AppGossipF            func(nodeID ids.NodeID, msg []byte) error
+	AppRequestFailedF     func(nodeID ids.NodeID, requestID uint32) error
+	VersionF              func() (string, error)
 }
 
 func (vm *TestVM) Default(cant bool) {
 	vm.CantInitialize = cant
-	vm.CantBootstrapping = cant
-	vm.CantBootstrapped = cant
+	vm.CantSetState = cant
 	vm.CantShutdown = cant
 	vm.CantCreateHandlers = cant
 	vm.CantCreateStaticHandlers = cant
@@ -84,28 +83,15 @@ func (vm *TestVM) Initialize(ctx *snow.Context, db manager.Manager, genesisBytes
 	return errInitialize
 }
 
-func (vm *TestVM) Bootstrapping() error {
-	if vm.BootstrappingF != nil {
-		return vm.BootstrappingF()
+func (vm *TestVM) SetState(state snow.State) error {
+	if vm.SetStateF != nil {
+		return vm.SetStateF(state)
 	}
-	if vm.CantBootstrapping {
+	if vm.CantSetState {
 		if vm.T != nil {
-			vm.T.Fatal(errBootstrapping)
+			vm.T.Fatal(errSetState)
 		}
-		return errBootstrapping
-	}
-	return nil
-}
-
-func (vm *TestVM) Bootstrapped() error {
-	if vm.BootstrappedF != nil {
-		return vm.BootstrappedF()
-	}
-	if vm.CantBootstrapped {
-		if vm.T != nil {
-			vm.T.Fatal(errBootstrapped)
-		}
-		return errBootstrapped
+		return errSetState
 	}
 	return nil
 }
@@ -153,7 +139,7 @@ func (vm *TestVM) HealthCheck() (interface{}, error) {
 	return nil, errHealthCheck
 }
 
-func (vm *TestVM) AppRequestFailed(nodeID ids.ShortID, requestID uint32) error {
+func (vm *TestVM) AppRequestFailed(nodeID ids.NodeID, requestID uint32) error {
 	if vm.AppRequestFailedF != nil {
 		return vm.AppRequestFailedF(nodeID, requestID)
 	}
@@ -166,7 +152,7 @@ func (vm *TestVM) AppRequestFailed(nodeID ids.ShortID, requestID uint32) error {
 	return errAppRequest
 }
 
-func (vm *TestVM) AppRequest(nodeID ids.ShortID, requestID uint32, deadline time.Time, request []byte) error {
+func (vm *TestVM) AppRequest(nodeID ids.NodeID, requestID uint32, deadline time.Time, request []byte) error {
 	if vm.AppRequestF != nil {
 		return vm.AppRequestF(nodeID, requestID, deadline, request)
 	}
@@ -179,7 +165,7 @@ func (vm *TestVM) AppRequest(nodeID ids.ShortID, requestID uint32, deadline time
 	return errAppRequest
 }
 
-func (vm *TestVM) AppResponse(nodeID ids.ShortID, requestID uint32, response []byte) error {
+func (vm *TestVM) AppResponse(nodeID ids.NodeID, requestID uint32, response []byte) error {
 	if vm.AppResponseF != nil {
 		return vm.AppResponseF(nodeID, requestID, response)
 	}
@@ -192,7 +178,7 @@ func (vm *TestVM) AppResponse(nodeID ids.ShortID, requestID uint32, response []b
 	return errAppResponse
 }
 
-func (vm *TestVM) AppGossip(nodeID ids.ShortID, msg []byte) error {
+func (vm *TestVM) AppGossip(nodeID ids.NodeID, msg []byte) error {
 	if vm.AppGossipF != nil {
 		return vm.AppGossipF(nodeID, msg)
 	}
@@ -205,7 +191,7 @@ func (vm *TestVM) AppGossip(nodeID ids.ShortID, msg []byte) error {
 	return errAppGossip
 }
 
-func (vm *TestVM) Connected(id ids.ShortID, nodeVersion version.Application) error {
+func (vm *TestVM) Connected(id ids.NodeID, nodeVersion *version.Application) error {
 	if vm.ConnectedF != nil {
 		return vm.ConnectedF(id, nodeVersion)
 	}
@@ -215,7 +201,7 @@ func (vm *TestVM) Connected(id ids.ShortID, nodeVersion version.Application) err
 	return nil
 }
 
-func (vm *TestVM) Disconnected(id ids.ShortID) error {
+func (vm *TestVM) Disconnected(id ids.NodeID) error {
 	if vm.DisconnectedF != nil {
 		return vm.DisconnectedF(id)
 	}

@@ -15,12 +15,13 @@ import (
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/message"
+	"github.com/ava-labs/avalanchego/snow/networking/benchlist"
+	"github.com/ava-labs/avalanchego/snow/networking/handler"
 	"github.com/ava-labs/avalanchego/snow/networking/timeout"
 	"github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/avalanchego/utils/hashing"
 	"github.com/ava-labs/avalanchego/utils/linkedhashmap"
 	"github.com/ava-labs/avalanchego/utils/logging"
-	"github.com/ava-labs/avalanchego/utils/timer"
 	"github.com/ava-labs/avalanchego/utils/timer/mockable"
 	"github.com/ava-labs/avalanchego/utils/wrappers"
 	"github.com/ava-labs/avalanchego/version"
@@ -29,7 +30,8 @@ import (
 var (
 	errUnknownChain = errors.New("received message for unknown chain")
 
-	_ Router = &ChainRouter{}
+	_ Router              = &ChainRouter{}
+	_ benchlist.Benchable = &ChainRouter{}
 )
 
 type requestEntry struct {
@@ -37,6 +39,11 @@ type requestEntry struct {
 	time time.Time
 	// The type of request that was made
 	op message.Op
+}
+
+type peer struct {
+	version        *version.Application
+	trackedSubnets ids.Set
 }
 
 // ChainRouter routes incoming messages from the validator network
@@ -48,19 +55,18 @@ type ChainRouter struct {
 	log        logging.Logger
 	msgCreator message.Creator
 	lock       sync.Mutex
-	chains     map[ids.ID]*Handler
+	chains     map[ids.ID]handler.Handler
 
 	// It is only safe to call [RegisterResponse] with the router lock held. Any
 	// other calls to the timeout manager with the router lock held could cause
 	// a deadlock because the timeout manager will call Benched and Unbenched.
-	timeoutManager *timeout.Manager
+	timeoutManager timeout.Manager
 
-	gossiper     *timer.Repeater
 	closeTimeout time.Duration
-	peers        map[ids.ShortID]version.Application
+	peers        map[ids.NodeID]*peer
 	// node ID --> chains that node is benched on
 	// invariant: if a node is benched on any chain, it is treated as disconnected on all chains
-	benched        map[ids.ShortID]ids.Set
+	benched        map[ids.NodeID]ids.Set
 	criticalChains ids.Set
 	onFatal        func(exitCode int)
 	metrics        *routerMetrics
@@ -78,17 +84,14 @@ type ChainRouter struct {
 // When this router receives an incoming message, it cancels the timeout in
 // [timeouts] associated with the request that caused the incoming message, if
 // applicable.
-//
-// This router also fires a gossip event every [gossipFrequency] to the engine,
-// notifying the engine it should gossip it's accepted set.
 func (cr *ChainRouter) Initialize(
-	nodeID ids.ShortID,
+	nodeID ids.NodeID,
 	log logging.Logger,
 	msgCreator message.Creator,
-	timeoutManager *timeout.Manager,
-	gossipFrequency time.Duration,
+	timeoutManager timeout.Manager,
 	closeTimeout time.Duration,
 	criticalChains ids.Set,
+	whitelistedSubnets ids.Set,
 	onFatal func(exitCode int),
 	healthConfig HealthConfig,
 	metricsNamespace string,
@@ -96,18 +99,24 @@ func (cr *ChainRouter) Initialize(
 ) error {
 	cr.log = log
 	cr.msgCreator = msgCreator
-	cr.chains = make(map[ids.ID]*Handler)
+	cr.chains = make(map[ids.ID]handler.Handler)
 	cr.timeoutManager = timeoutManager
-	cr.gossiper = timer.NewRepeater(cr.Gossip, gossipFrequency)
 	cr.closeTimeout = closeTimeout
-	cr.benched = make(map[ids.ShortID]ids.Set)
+	cr.benched = make(map[ids.NodeID]ids.Set)
 	cr.criticalChains = criticalChains
 	cr.onFatal = onFatal
 	cr.timedRequests = linkedhashmap.New()
-	cr.peers = make(map[ids.ShortID]version.Application)
-	cr.peers[nodeID] = version.CurrentApp
+	cr.peers = make(map[ids.NodeID]*peer)
 	cr.healthConfig = healthConfig
 	cr.requestIDBytes = make([]byte, hashing.AddrLen+hashing.HashLen+wrappers.IntLen+wrappers.ByteLen) // Validator ID, Chain ID, Request ID, Msg Type
+
+	// Mark myself as connected
+	myself := &peer{
+		version: version.CurrentApp,
+	}
+	myself.trackedSubnets.Union(whitelistedSubnets)
+	myself.trackedSubnets.Add(constants.PrimaryNetworkID)
+	cr.peers[nodeID] = myself
 
 	// Register metrics
 	rMetrics, err := newRouterMetrics(metricsNamespace, metricsRegisterer)
@@ -115,8 +124,6 @@ func (cr *ChainRouter) Initialize(
 		return err
 	}
 	cr.metrics = rMetrics
-
-	go log.RecoverAndPanic(cr.gossiper.Dispatch)
 	return nil
 }
 
@@ -129,7 +136,7 @@ func (cr *ChainRouter) Initialize(
 // This method registers a timeout that calls such methods if we don't get a
 // reply in time.
 func (cr *ChainRouter) RegisterRequest(
-	nodeID ids.ShortID,
+	nodeID ids.NodeID,
 	chainID ids.ID,
 	requestID uint32,
 	op message.Op,
@@ -182,7 +189,7 @@ func (cr *ChainRouter) HandleInbound(msg message.InboundMessage) {
 
 	// Get the chain, if it exists
 	chain, exists := cr.chains[chainID]
-	if !exists || !chain.isValidator(nodeID) {
+	if !exists || !chain.IsValidator(nodeID) {
 		cr.log.Debug(
 			"Message %s from (%s. %s) dropped. Error: %s",
 			op,
@@ -195,9 +202,11 @@ func (cr *ChainRouter) HandleInbound(msg message.InboundMessage) {
 		return
 	}
 
+	ctx := chain.Context()
+
 	if _, notRequested := message.UnrequestedOps[op]; notRequested ||
 		(op == message.Put && requestID == constants.GossipMsgRequestID) {
-		if chain.ctx.IsExecuting() {
+		if ctx.IsExecuting() {
 			cr.log.Debug("dropping %s and skipping queue since the chain is currently executing", op)
 			cr.metrics.droppedRequests.Inc()
 
@@ -226,7 +235,7 @@ func (cr *ChainRouter) HandleInbound(msg message.InboundMessage) {
 		return
 	}
 
-	if chain.ctx.IsExecuting() {
+	if ctx.IsExecuting() {
 		cr.log.Debug("dropping %s and skipping queue since the chain is currently executing", op)
 		cr.metrics.droppedRequests.Inc()
 
@@ -256,143 +265,150 @@ func (cr *ChainRouter) Shutdown() {
 	cr.log.Info("shutting down chain router")
 	cr.lock.Lock()
 	prevChains := cr.chains
-	cr.chains = map[ids.ID]*Handler{}
+	cr.chains = map[ids.ID]handler.Handler{}
 	cr.lock.Unlock()
 
-	cr.gossiper.Stop()
-
 	for _, chain := range prevChains {
-		chain.StartShutdown()
+		chain.Stop()
 	}
 
 	ticker := time.NewTicker(cr.closeTimeout)
-	timedOut := false
+	defer ticker.Stop()
+
 	for _, chain := range prevChains {
 		select {
-		case <-chain.closed:
+		case <-chain.Stopped():
 		case <-ticker.C:
-			timedOut = true
+			cr.log.Warn("timed out while shutting down the chains")
+			return
 		}
 	}
-	if timedOut {
-		cr.log.Warn("timed out while shutting down the chains")
-	}
-	ticker.Stop()
 }
 
 // AddChain registers the specified chain so that incoming
 // messages can be routed to it
-func (cr *ChainRouter) AddChain(chain *Handler) {
+func (cr *ChainRouter) AddChain(chain handler.Handler) {
 	cr.lock.Lock()
 	defer cr.lock.Unlock()
 
 	chainID := chain.Context().ChainID
 	cr.log.Debug("registering chain %s with chain router", chainID)
-	chain.onCloseF = func() { cr.removeChain(chainID) }
+	chain.SetOnStopped(func() {
+		cr.removeChain(chainID)
+	})
 	cr.chains[chainID] = chain
 
-	for validatorID, version := range cr.peers {
+	// Notify connected validators
+	subnetID := chain.Context().SubnetID
+	for validatorID, peer := range cr.peers {
 		// If this validator is benched on any chain, treat them as disconnected on all chains
-		if _, benched := cr.benched[validatorID]; !benched {
-			msg := cr.msgCreator.InternalConnected(validatorID, version)
+		if _, benched := cr.benched[validatorID]; !benched && peer.trackedSubnets.Contains(subnetID) {
+			msg := cr.msgCreator.InternalConnected(validatorID, peer.version)
 			chain.Push(msg)
 		}
 	}
 }
 
 // Connected routes an incoming notification that a validator was just connected
-func (cr *ChainRouter) Connected(validatorID ids.ShortID, nodeVersion version.Application) {
+func (cr *ChainRouter) Connected(nodeID ids.NodeID, nodeVersion *version.Application, subnetID ids.ID) {
 	cr.lock.Lock()
 	defer cr.lock.Unlock()
 
-	cr.peers[validatorID] = nodeVersion
+	connectedPeer, exists := cr.peers[nodeID]
+	if !exists {
+		connectedPeer = &peer{
+			version: nodeVersion,
+		}
+		cr.peers[nodeID] = connectedPeer
+	}
+	connectedPeer.trackedSubnets.Add(subnetID)
+
 	// If this validator is benched on any chain, treat them as disconnected on all chains
-	if _, benched := cr.benched[validatorID]; benched {
+	if _, benched := cr.benched[nodeID]; benched {
 		return
 	}
 
-	msg := cr.msgCreator.InternalConnected(validatorID, nodeVersion)
+	msg := cr.msgCreator.InternalConnected(nodeID, nodeVersion)
 
 	// TODO: fire up an event when validator state changes i.e when they leave set, disconnect.
 	// we cannot put a subnet-only validator check here since Disconnected would not be handled properly.
 	for _, chain := range cr.chains {
-		chain.Push(msg)
+		if subnetID == chain.Context().SubnetID {
+			chain.Push(msg)
+		}
 	}
 }
 
 // Disconnected routes an incoming notification that a validator was connected
-func (cr *ChainRouter) Disconnected(validatorID ids.ShortID) {
+func (cr *ChainRouter) Disconnected(nodeID ids.NodeID) {
 	cr.lock.Lock()
 	defer cr.lock.Unlock()
 
-	delete(cr.peers, validatorID)
-	if _, benched := cr.benched[validatorID]; benched {
+	peer := cr.peers[nodeID]
+	delete(cr.peers, nodeID)
+	if _, benched := cr.benched[nodeID]; benched {
 		return
 	}
 
-	msg := cr.msgCreator.InternalDisconnected(validatorID)
+	msg := cr.msgCreator.InternalDisconnected(nodeID)
 
 	// TODO: fire up an event when validator state changes i.e when they leave set, disconnect.
 	// we cannot put a subnet-only validator check here since if a validator connects then it leaves validator-set, it would not be disconnected properly.
 	for _, chain := range cr.chains {
-		chain.Push(msg)
+		if peer.trackedSubnets.Contains(chain.Context().SubnetID) {
+			chain.Push(msg)
+		}
 	}
 }
 
 // Benched routes an incoming notification that a validator was benched
-func (cr *ChainRouter) Benched(chainID ids.ID, validatorID ids.ShortID) {
+func (cr *ChainRouter) Benched(chainID ids.ID, nodeID ids.NodeID) {
 	cr.lock.Lock()
 	defer cr.lock.Unlock()
 
-	benchedChains, exists := cr.benched[validatorID]
+	benchedChains, exists := cr.benched[nodeID]
 	benchedChains.Add(chainID)
-	cr.benched[validatorID] = benchedChains
-	_, hasPeer := cr.peers[validatorID]
+	cr.benched[nodeID] = benchedChains
+	peer, hasPeer := cr.peers[nodeID]
 	if exists || !hasPeer {
 		// If the set already existed, then the node was previously benched.
 		return
 	}
 
-	msg := cr.msgCreator.InternalDisconnected(validatorID)
+	msg := cr.msgCreator.InternalDisconnected(nodeID)
 
 	for _, chain := range cr.chains {
-		chain.Push(msg)
+		if peer.trackedSubnets.Contains(chain.Context().SubnetID) {
+			chain.Push(msg)
+		}
 	}
 }
 
 // Unbenched routes an incoming notification that a validator was just unbenched
-func (cr *ChainRouter) Unbenched(chainID ids.ID, validatorID ids.ShortID) {
+func (cr *ChainRouter) Unbenched(chainID ids.ID, nodeID ids.NodeID) {
 	cr.lock.Lock()
 	defer cr.lock.Unlock()
 
-	benchedChains := cr.benched[validatorID]
+	benchedChains := cr.benched[nodeID]
 	benchedChains.Remove(chainID)
 	if benchedChains.Len() == 0 {
-		delete(cr.benched, validatorID)
+		delete(cr.benched, nodeID)
 	} else {
-		cr.benched[validatorID] = benchedChains
+		cr.benched[nodeID] = benchedChains
 		return // This node is still benched
 	}
 
-	version, found := cr.peers[validatorID]
+	peer, found := cr.peers[nodeID]
 	if !found {
 		return
 	}
 
-	msg := cr.msgCreator.InternalConnected(validatorID, version)
+	msg := cr.msgCreator.InternalConnected(nodeID, peer.version)
 
 	for _, chain := range cr.chains {
-		chain.Push(msg)
-	}
-}
-
-// Gossip accepted containers
-func (cr *ChainRouter) Gossip() {
-	cr.lock.Lock()
-	defer cr.lock.Unlock()
-
-	for _, chain := range cr.chains {
-		chain.Gossip()
+		if peer.trackedSubnets.Contains(chain.Context().SubnetID) {
+			chain.Push(msg)
+		}
 	}
 }
 
@@ -449,15 +465,15 @@ func (cr *ChainRouter) removeChain(chainID ids.ID) {
 	delete(cr.chains, chainID)
 	cr.lock.Unlock()
 
-	chain.StartShutdown()
+	chain.Stop()
 
 	ticker := time.NewTicker(cr.closeTimeout)
+	defer ticker.Stop()
 	select {
-	case <-chain.closed:
+	case <-chain.Stopped():
 	case <-ticker.C:
 		chain.Context().Log.Warn("timed out while shutting down")
 	}
-	ticker.Stop()
 
 	if cr.onFatal != nil && cr.criticalChains.Contains(chainID) {
 		go cr.onFatal(1)
@@ -466,13 +482,12 @@ func (cr *ChainRouter) removeChain(chainID ids.ID) {
 
 func (cr *ChainRouter) clearRequest(
 	op message.Op,
-	nodeID ids.ShortID,
+	nodeID ids.NodeID,
 	chainID ids.ID,
 	requestID uint32,
 ) (ids.ID, *requestEntry) {
 	// Create the request ID of the request we sent that this message is (allegedly) in response to.
 	uniqueRequestID := cr.createRequestID(nodeID, chainID, requestID, op)
-
 	// Mark that an outstanding request has been fulfilled
 	requestIntf, exists := cr.timedRequests.Get(uniqueRequestID)
 	if !exists {
@@ -488,7 +503,11 @@ func (cr *ChainRouter) clearRequest(
 
 // Assumes [cr.lock] is held.
 // Assumes [message.Op] is an alias of byte.
-func (cr *ChainRouter) createRequestID(nodeID ids.ShortID, chainID ids.ID, requestID uint32, op message.Op) ids.ID {
+func (cr *ChainRouter) createRequestID(nodeID ids.NodeID, chainID ids.ID, requestID uint32, op message.Op) ids.ID {
+	// Make sure to standardize chits messages.
+	if op == message.ChitsV2 {
+		op = message.Chits
+	}
 	copy(cr.requestIDBytes, nodeID[:])
 	copy(cr.requestIDBytes[hashing.AddrLen:], chainID[:])
 	binary.BigEndian.PutUint32(cr.requestIDBytes[hashing.AddrLen+hashing.HashLen:], requestID)

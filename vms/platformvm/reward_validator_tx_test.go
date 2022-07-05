@@ -12,6 +12,7 @@ import (
 	"github.com/ava-labs/avalanchego/chains"
 	"github.com/ava-labs/avalanchego/database/manager"
 	"github.com/ava-labs/avalanchego/ids"
+	"github.com/ava-labs/avalanchego/snow"
 	"github.com/ava-labs/avalanchego/snow/engine/common"
 	"github.com/ava-labs/avalanchego/snow/uptime"
 	"github.com/ava-labs/avalanchego/snow/validators"
@@ -20,13 +21,15 @@ import (
 	"github.com/ava-labs/avalanchego/utils/math"
 	"github.com/ava-labs/avalanchego/version"
 	"github.com/ava-labs/avalanchego/vms/components/avax"
+	"github.com/ava-labs/avalanchego/vms/platformvm/config"
 	"github.com/ava-labs/avalanchego/vms/platformvm/reward"
 	"github.com/ava-labs/avalanchego/vms/platformvm/status"
+	"github.com/ava-labs/avalanchego/vms/platformvm/txs"
 	"github.com/ava-labs/avalanchego/vms/secp256k1fx"
 )
 
 func TestUnsignedRewardValidatorTxExecuteOnCommit(t *testing.T) {
-	vm, _, _ := defaultVM()
+	vm, _, _, _ := defaultVM()
 	vm.ctx.Lock.Lock()
 	defer func() {
 		if err := vm.Shutdown(); err != nil {
@@ -35,47 +38,75 @@ func TestUnsignedRewardValidatorTxExecuteOnCommit(t *testing.T) {
 		vm.ctx.Lock.Unlock()
 	}()
 
-	currentStakers := vm.internalState.CurrentStakerChainState()
+	currentStakers := vm.internalState.CurrentStakers()
 	toRemoveTx, _, err := currentStakers.GetNextStaker()
 	if err != nil {
 		t.Fatal(err)
 	}
-	toRemove := toRemoveTx.UnsignedTx.(*UnsignedAddValidatorTx)
+	toRemove := toRemoveTx.Unsigned.(*txs.AddValidatorTx)
+	toRemoveTxID := toRemoveTx.ID()
 
-	// Case 1: Chain timestamp is wrong
-	if tx, err := vm.newRewardValidatorTx(toRemove.ID()); err != nil {
-		t.Fatal(err)
-	} else if _, _, err := toRemove.Execute(vm, vm.internalState, tx); err == nil {
-		t.Fatalf("should have failed because validator end time doesn't match chain timestamp")
+	{
+		// Case 1: Chain timestamp is wrong
+		tx, err := vm.txBuilder.NewRewardValidatorTx(toRemoveTxID)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		executor := proposalTxExecutor{
+			vm:          vm,
+			parentState: vm.internalState,
+			tx:          tx,
+		}
+		err = tx.Unsigned.Visit(&executor)
+		if err == nil {
+			t.Fatalf("should have failed because validator end time doesn't match chain timestamp")
+		}
 	}
 
 	// Advance chain timestamp to time that next validator leaves
 	vm.internalState.SetTimestamp(toRemove.EndTime())
 
-	// Case 2: Wrong validator
-	if tx, err := vm.newRewardValidatorTx(ids.GenerateTestID()); err != nil {
-		t.Fatal(err)
-	} else if _, _, err := toRemove.Execute(vm, vm.internalState, tx); err == nil {
-		t.Fatalf("should have failed because validator ID is wrong")
+	{
+		// Case 2: Wrong validator
+		tx, err := vm.txBuilder.NewRewardValidatorTx(ids.GenerateTestID())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		executor := proposalTxExecutor{
+			vm:          vm,
+			parentState: vm.internalState,
+			tx:          tx,
+		}
+		err = tx.Unsigned.Visit(&executor)
+		if err == nil {
+			t.Fatalf("should have failed because validator ID is wrong")
+		}
 	}
 
 	// Case 3: Happy path
-	tx, err := vm.newRewardValidatorTx(toRemove.ID())
+	tx, err := vm.txBuilder.NewRewardValidatorTx(toRemoveTxID)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	onCommitState, _, err := tx.UnsignedTx.(UnsignedProposalTx).Execute(vm, vm.internalState, tx)
+	executor := proposalTxExecutor{
+		vm:          vm,
+		parentState: vm.internalState,
+		tx:          tx,
+	}
+	err = tx.Unsigned.Visit(&executor)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	onCommitCurrentStakers := onCommitState.CurrentStakerChainState()
+	onCommitCurrentStakers := executor.onCommit.CurrentStakers()
 	nextToRemoveTx, _, err := onCommitCurrentStakers.GetNextStaker()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if toRemove.ID() == nextToRemoveTx.ID() {
+	if toRemoveTxID == nextToRemoveTx.ID() {
 		t.Fatalf("Should have removed the previous validator")
 	}
 
@@ -88,7 +119,7 @@ func TestUnsignedRewardValidatorTxExecuteOnCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	onCommitState.Apply(vm.internalState)
+	executor.onCommit.Apply(vm.internalState)
 	if err := vm.internalState.Commit(); err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +136,7 @@ func TestUnsignedRewardValidatorTxExecuteOnCommit(t *testing.T) {
 }
 
 func TestUnsignedRewardValidatorTxExecuteOnAbort(t *testing.T) {
-	vm, _, _ := defaultVM()
+	vm, _, _, _ := defaultVM()
 	vm.ctx.Lock.Lock()
 	defer func() {
 		if err := vm.Shutdown(); err != nil {
@@ -114,79 +145,109 @@ func TestUnsignedRewardValidatorTxExecuteOnAbort(t *testing.T) {
 		vm.ctx.Lock.Unlock()
 	}()
 
-	currentStakers := vm.internalState.CurrentStakerChainState()
+	currentStakers := vm.internalState.CurrentStakers()
 	toRemoveTx, _, err := currentStakers.GetNextStaker()
 	if err != nil {
 		t.Fatal(err)
 	}
-	toRemove := toRemoveTx.UnsignedTx.(*UnsignedAddValidatorTx)
+	toRemoveTxID := toRemoveTx.ID()
+	toRemove := toRemoveTx.Unsigned.(*txs.AddValidatorTx)
 
-	// Case 1: Chain timestamp is wrong
-	if tx, err := vm.newRewardValidatorTx(toRemove.ID()); err != nil {
-		t.Fatal(err)
-	} else if _, _, err := toRemove.Execute(vm, vm.internalState, tx); err == nil {
-		t.Fatalf("should have failed because validator end time doesn't match chain timestamp")
+	{
+		// Case 1: Chain timestamp is wrong
+		tx, err := vm.txBuilder.NewRewardValidatorTx(toRemoveTxID)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		executor := proposalTxExecutor{
+			vm:          vm,
+			parentState: vm.internalState,
+			tx:          tx,
+		}
+		err = tx.Unsigned.Visit(&executor)
+		if err == nil {
+			t.Fatalf("should have failed because validator end time doesn't match chain timestamp")
+		}
 	}
 
 	// Advance chain timestamp to time that next validator leaves
 	vm.internalState.SetTimestamp(toRemove.EndTime())
 
-	// Case 2: Wrong validator
-	if tx, err := vm.newRewardValidatorTx(ids.GenerateTestID()); err != nil {
-		t.Fatal(err)
-	} else if _, _, err := toRemove.Execute(vm, vm.internalState, tx); err == nil {
-		t.Fatalf("should have failed because validator ID is wrong")
+	{
+		// Case 2: Wrong validator
+		tx, err := vm.txBuilder.NewRewardValidatorTx(ids.GenerateTestID())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		executor := proposalTxExecutor{
+			vm:          vm,
+			parentState: vm.internalState,
+			tx:          tx,
+		}
+		err = tx.Unsigned.Visit(&executor)
+		if err == nil {
+			t.Fatalf("should have failed because validator ID is wrong")
+		}
 	}
 
-	// Case 3: Happy path
-	tx, err := vm.newRewardValidatorTx(toRemove.ID())
-	if err != nil {
-		t.Fatal(err)
-	}
+	{
+		// Case 3: Happy path
+		tx, err := vm.txBuilder.NewRewardValidatorTx(toRemoveTxID)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-	_, onAbortState, err := tx.UnsignedTx.(UnsignedProposalTx).Execute(vm, vm.internalState, tx)
-	if err != nil {
-		t.Fatal(err)
-	}
+		executor := proposalTxExecutor{
+			vm:          vm,
+			parentState: vm.internalState,
+			tx:          tx,
+		}
+		err = tx.Unsigned.Visit(&executor)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-	onAbortCurrentStakers := onAbortState.CurrentStakerChainState()
-	nextToRemoveTx, _, err := onAbortCurrentStakers.GetNextStaker()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if toRemove.ID() == nextToRemoveTx.ID() {
-		t.Fatalf("Should have removed the previous validator")
-	}
+		onAbortCurrentStakers := executor.onAbort.CurrentStakers()
+		nextToRemoveTx, _, err := onAbortCurrentStakers.GetNextStaker()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if toRemoveTxID == nextToRemoveTx.ID() {
+			t.Fatalf("Should have removed the previous validator")
+		}
 
-	// check that stake/reward isn't given back
-	stakeOwners := toRemove.Stake[0].Out.(*secp256k1fx.TransferOutput).AddressesSet()
+		// check that stake/reward isn't given back
+		stakeOwners := toRemove.Stake[0].Out.(*secp256k1fx.TransferOutput).AddressesSet()
 
-	// Get old balances
-	oldBalance, err := avax.GetBalance(vm.internalState, stakeOwners)
-	if err != nil {
-		t.Fatal(err)
-	}
+		// Get old balances
+		oldBalance, err := avax.GetBalance(vm.internalState, stakeOwners)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-	onAbortState.Apply(vm.internalState)
-	if err := vm.internalState.Commit(); err != nil {
-		t.Fatal(err)
-	}
+		executor.onAbort.Apply(vm.internalState)
+		if err := vm.internalState.Commit(); err != nil {
+			t.Fatal(err)
+		}
 
-	onAbortBalance, err := avax.GetBalance(vm.internalState, stakeOwners)
-	if err != nil {
-		t.Fatal(err)
-	}
+		onAbortBalance, err := avax.GetBalance(vm.internalState, stakeOwners)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-	if onAbortBalance != oldBalance+toRemove.Validator.Weight() {
-		t.Fatalf("on abort, should have old balance (%d) + staked amount (%d) but have %d",
-			oldBalance, toRemove.Validator.Weight(), onAbortBalance)
+		if onAbortBalance != oldBalance+toRemove.Validator.Weight() {
+			t.Fatalf("on abort, should have old balance (%d) + staked amount (%d) but have %d",
+				oldBalance, toRemove.Validator.Weight(), onAbortBalance)
+		}
 	}
 }
 
 func TestRewardDelegatorTxExecuteOnCommit(t *testing.T) {
 	assert := assert.New(t)
 
-	vm, _, _ := defaultVM()
+	vm, _, _, _ := defaultVM()
 	vm.ctx.Lock.Lock()
 	defer func() {
 		err := vm.Shutdown()
@@ -200,9 +261,9 @@ func TestRewardDelegatorTxExecuteOnCommit(t *testing.T) {
 
 	vdrStartTime := uint64(defaultValidateStartTime.Unix()) + 1
 	vdrEndTime := uint64(defaultValidateStartTime.Add(2 * defaultMinStakingDuration).Unix())
-	vdrNodeID := ids.GenerateTestShortID()
-	vdrTx, err := vm.newAddValidatorTx(
-		vm.MinValidatorStake, // stakeAmt
+	vdrNodeID := ids.GenerateTestNodeID()
+	vdrTx, err := vm.txBuilder.NewAddValidatorTx(
+		vm.MinValidatorStake, // stakeAmount
 		vdrStartTime,
 		vdrEndTime,
 		vdrNodeID,        // node ID
@@ -215,8 +276,8 @@ func TestRewardDelegatorTxExecuteOnCommit(t *testing.T) {
 
 	delStartTime := vdrStartTime
 	delEndTime := vdrEndTime
-	delTx, err := vm.newAddDelegatorTx(
-		vm.MinDelegatorStake, // stakeAmt
+	delTx, err := vm.txBuilder.NewAddDelegatorTx(
+		vm.MinDelegatorStake, // stakeAmount
 		delStartTime,
 		delEndTime,
 		vdrNodeID,                               // node ID
@@ -233,7 +294,7 @@ func TestRewardDelegatorTxExecuteOnCommit(t *testing.T) {
 	vm.internalState.SetTimestamp(time.Unix(int64(delEndTime), 0))
 	err = vm.internalState.Commit()
 	assert.NoError(err)
-	err = vm.internalState.(*internalStateImpl).loadCurrentValidators()
+	err = vm.internalState.Load()
 	assert.NoError(err)
 	// test validator stake
 	set, ok := vm.Validators.GetValidators(constants.PrimaryNetworkID)
@@ -242,10 +303,15 @@ func TestRewardDelegatorTxExecuteOnCommit(t *testing.T) {
 	assert.True(ok)
 	assert.Equal(vm.MinValidatorStake+vm.MinDelegatorStake, stake)
 
-	tx, err := vm.newRewardValidatorTx(delTx.ID())
+	tx, err := vm.txBuilder.NewRewardValidatorTx(delTx.ID())
 	assert.NoError(err)
 
-	onCommitState, _, err := tx.UnsignedTx.(UnsignedProposalTx).Execute(vm, vm.internalState, tx)
+	executor := proposalTxExecutor{
+		vm:          vm,
+		parentState: vm.internalState,
+		tx:          tx,
+	}
+	err = tx.Unsigned.Visit(&executor)
 	assert.NoError(err)
 
 	vdrDestSet := ids.ShortSet{}
@@ -260,7 +326,7 @@ func TestRewardDelegatorTxExecuteOnCommit(t *testing.T) {
 	oldDelBalance, err := avax.GetBalance(vm.internalState, delDestSet)
 	assert.NoError(err)
 
-	onCommitState.Apply(vm.internalState)
+	executor.onCommit.Apply(vm.internalState)
 	err = vm.internalState.Commit()
 	assert.NoError(err)
 
@@ -289,7 +355,7 @@ func TestRewardDelegatorTxExecuteOnCommit(t *testing.T) {
 func TestRewardDelegatorTxExecuteOnAbort(t *testing.T) {
 	assert := assert.New(t)
 
-	vm, _, _ := defaultVM()
+	vm, _, _, _ := defaultVM()
 	vm.ctx.Lock.Lock()
 	defer func() {
 		err := vm.Shutdown()
@@ -305,9 +371,9 @@ func TestRewardDelegatorTxExecuteOnAbort(t *testing.T) {
 
 	vdrStartTime := uint64(defaultValidateStartTime.Unix()) + 1
 	vdrEndTime := uint64(defaultValidateStartTime.Add(2 * defaultMinStakingDuration).Unix())
-	vdrNodeID := ids.GenerateTestShortID()
-	vdrTx, err := vm.newAddValidatorTx(
-		vm.MinValidatorStake, // stakeAmt
+	vdrNodeID := ids.GenerateTestNodeID()
+	vdrTx, err := vm.txBuilder.NewAddValidatorTx(
+		vm.MinValidatorStake, // stakeAmount
 		vdrStartTime,
 		vdrEndTime,
 		vdrNodeID,        // node ID
@@ -320,8 +386,8 @@ func TestRewardDelegatorTxExecuteOnAbort(t *testing.T) {
 
 	delStartTime := vdrStartTime
 	delEndTime := vdrEndTime
-	delTx, err := vm.newAddDelegatorTx(
-		vm.MinDelegatorStake, // stakeAmt
+	delTx, err := vm.txBuilder.NewAddDelegatorTx(
+		vm.MinDelegatorStake, // stakeAmount
 		delStartTime,
 		delEndTime,
 		vdrNodeID,                               // node ID
@@ -338,13 +404,18 @@ func TestRewardDelegatorTxExecuteOnAbort(t *testing.T) {
 	vm.internalState.SetTimestamp(time.Unix(int64(delEndTime), 0))
 	err = vm.internalState.Commit()
 	assert.NoError(err)
-	err = vm.internalState.(*internalStateImpl).loadCurrentValidators()
+	err = vm.internalState.Load()
 	assert.NoError(err)
 
-	tx, err := vm.newRewardValidatorTx(delTx.ID())
+	tx, err := vm.txBuilder.NewRewardValidatorTx(delTx.ID())
 	assert.NoError(err)
 
-	_, onAbortState, err := tx.UnsignedTx.(UnsignedProposalTx).Execute(vm, vm.internalState, tx)
+	executor := proposalTxExecutor{
+		vm:          vm,
+		parentState: vm.internalState,
+		tx:          tx,
+	}
+	err = tx.Unsigned.Visit(&executor)
 	assert.NoError(err)
 
 	vdrDestSet := ids.ShortSet{}
@@ -359,7 +430,7 @@ func TestRewardDelegatorTxExecuteOnAbort(t *testing.T) {
 	oldDelBalance, err := avax.GetBalance(vm.internalState, delDestSet)
 	assert.NoError(err)
 
-	onAbortState.Apply(vm.internalState)
+	executor.onAbort.Apply(vm.internalState)
 	err = vm.internalState.Commit()
 	assert.NoError(err)
 
@@ -382,15 +453,17 @@ func TestRewardDelegatorTxExecuteOnAbort(t *testing.T) {
 
 func TestUptimeDisallowedWithRestart(t *testing.T) {
 	_, genesisBytes := defaultGenesis()
-	db := manager.NewMemDB(version.DefaultVersion1_0_0)
+	db := manager.NewMemDB(version.Semantic1_0_0)
 
 	firstDB := db.NewPrefixDBManager([]byte{})
 	firstVM := &VM{Factory: Factory{
-		Chains:                 chains.MockManager{},
-		UptimePercentage:       .2,
-		RewardConfig:           defaultRewardConfig,
-		Validators:             validators.NewManager(),
-		UptimeLockedCalculator: uptime.NewLockedCalculator(),
+		Config: config.Config{
+			Chains:                 chains.MockManager{},
+			UptimePercentage:       .2,
+			RewardConfig:           defaultRewardConfig,
+			Validators:             validators.NewManager(),
+			UptimeLockedCalculator: uptime.NewLockedCalculator(),
+		},
 	}}
 
 	firstCtx := defaultContext()
@@ -404,11 +477,11 @@ func TestUptimeDisallowedWithRestart(t *testing.T) {
 	firstVM.clock.Set(defaultGenesisTime)
 	firstVM.uptimeManager.(uptime.TestManager).SetTime(defaultGenesisTime)
 
-	if err := firstVM.Bootstrapping(); err != nil {
+	if err := firstVM.SetState(snow.Bootstrapping); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := firstVM.Bootstrapped(); err != nil {
+	if err := firstVM.SetState(snow.NormalOp); err != nil {
 		t.Fatal(err)
 	}
 
@@ -422,10 +495,12 @@ func TestUptimeDisallowedWithRestart(t *testing.T) {
 
 	secondDB := db.NewPrefixDBManager([]byte{})
 	secondVM := &VM{Factory: Factory{
-		Chains:                 chains.MockManager{},
-		UptimePercentage:       .21,
-		Validators:             validators.NewManager(),
-		UptimeLockedCalculator: uptime.NewLockedCalculator(),
+		Config: config.Config{
+			Chains:                 chains.MockManager{},
+			UptimePercentage:       .21,
+			Validators:             validators.NewManager(),
+			UptimeLockedCalculator: uptime.NewLockedCalculator(),
+		},
 	}}
 
 	secondCtx := defaultContext()
@@ -445,11 +520,11 @@ func TestUptimeDisallowedWithRestart(t *testing.T) {
 	secondVM.clock.Set(defaultValidateStartTime.Add(2 * defaultMinStakingDuration))
 	secondVM.uptimeManager.(uptime.TestManager).SetTime(defaultValidateStartTime.Add(2 * defaultMinStakingDuration))
 
-	if err := secondVM.Bootstrapping(); err != nil {
+	if err := secondVM.SetState(snow.Bootstrapping); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := secondVM.Bootstrapped(); err != nil {
+	if err := secondVM.SetState(snow.NormalOp); err != nil {
 		t.Fatal(err)
 	}
 
@@ -572,8 +647,8 @@ func TestUptimeDisallowedWithRestart(t *testing.T) {
 		t.Fatalf("status should be Aborted but is %s", txStatus)
 	}
 
-	currentStakers := secondVM.internalState.CurrentStakerChainState()
-	_, err = currentStakers.GetValidator(keys[1].PublicKey().Address())
+	currentStakers := secondVM.internalState.CurrentStakers()
+	_, err = currentStakers.GetValidator(ids.NodeID(keys[1].PublicKey().Address()))
 	if err == nil {
 		t.Fatal("should have removed a genesis validator")
 	}
@@ -581,21 +656,23 @@ func TestUptimeDisallowedWithRestart(t *testing.T) {
 
 func TestUptimeDisallowedAfterNeverConnecting(t *testing.T) {
 	_, genesisBytes := defaultGenesis()
-	db := manager.NewMemDB(version.DefaultVersion1_0_0)
+	db := manager.NewMemDB(version.Semantic1_0_0)
 
 	vm := &VM{Factory: Factory{
-		Chains:                 chains.MockManager{},
-		UptimePercentage:       .2,
-		RewardConfig:           defaultRewardConfig,
-		Validators:             validators.NewManager(),
-		UptimeLockedCalculator: uptime.NewLockedCalculator(),
+		Config: config.Config{
+			Chains:                 chains.MockManager{},
+			UptimePercentage:       .2,
+			RewardConfig:           defaultRewardConfig,
+			Validators:             validators.NewManager(),
+			UptimeLockedCalculator: uptime.NewLockedCalculator(),
+		},
 	}}
 
 	ctx := defaultContext()
 	ctx.Lock.Lock()
 
 	msgChan := make(chan common.Message, 1)
-	appSender := &common.SenderTest{}
+	appSender := &common.SenderTest{T: t}
 	if err := vm.Initialize(ctx, db, genesisBytes, nil, nil, msgChan, nil, appSender); err != nil {
 		t.Fatal(err)
 	}
@@ -609,11 +686,11 @@ func TestUptimeDisallowedAfterNeverConnecting(t *testing.T) {
 	vm.clock.Set(defaultGenesisTime)
 	vm.uptimeManager.(uptime.TestManager).SetTime(defaultGenesisTime)
 
-	if err := vm.Bootstrapping(); err != nil {
+	if err := vm.SetState(snow.Bootstrapping); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := vm.Bootstrapped(); err != nil {
+	if err := vm.SetState(snow.NormalOp); err != nil {
 		t.Fatal(err)
 	}
 
@@ -704,8 +781,8 @@ func TestUptimeDisallowedAfterNeverConnecting(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	currentStakers := vm.internalState.CurrentStakerChainState()
-	_, err = currentStakers.GetValidator(keys[1].PublicKey().Address())
+	currentStakers := vm.internalState.CurrentStakers()
+	_, err = currentStakers.GetValidator(ids.NodeID(keys[1].PublicKey().Address()))
 	if err == nil {
 		t.Fatal("should have removed a genesis validator")
 	}

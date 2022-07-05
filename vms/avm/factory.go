@@ -4,14 +4,11 @@
 package avm
 
 import (
-	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow"
+	"github.com/ava-labs/avalanchego/vms"
 )
 
-// ID that this VM uses when labeled
-var (
-	ID = ids.ID{'a', 'v', 'm'}
-)
+var _ vms.Factory = &Factory{}
 
 type Factory struct {
 	TxFee            uint64

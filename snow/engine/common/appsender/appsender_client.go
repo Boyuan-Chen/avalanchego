@@ -8,21 +8,22 @@ import (
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow/engine/common"
-	"github.com/ava-labs/avalanchego/snow/engine/common/appsender/appsenderproto"
+
+	appsenderpb "github.com/ava-labs/avalanchego/proto/pb/appsender"
 )
 
 var _ common.AppSender = &Client{}
 
 type Client struct {
-	client appsenderproto.AppSenderClient
+	client appsenderpb.AppSenderClient
 }
 
 // NewClient returns a client that is connected to a remote AppSender.
-func NewClient(client appsenderproto.AppSenderClient) *Client {
+func NewClient(client appsenderpb.AppSenderClient) *Client {
 	return &Client{client: client}
 }
 
-func (c *Client) SendAppRequest(nodeIDs ids.ShortSet, requestID uint32, request []byte) error {
+func (c *Client) SendAppRequest(nodeIDs ids.NodeIDSet, requestID uint32, request []byte) error {
 	nodeIDsBytes := make([][]byte, nodeIDs.Len())
 	i := 0
 	for nodeID := range nodeIDs {
@@ -32,21 +33,21 @@ func (c *Client) SendAppRequest(nodeIDs ids.ShortSet, requestID uint32, request 
 	}
 	_, err := c.client.SendAppRequest(
 		context.Background(),
-		&appsenderproto.SendAppRequestMsg{
-			NodeIDs:   nodeIDsBytes,
-			RequestID: requestID,
+		&appsenderpb.SendAppRequestMsg{
+			NodeIds:   nodeIDsBytes,
+			RequestId: requestID,
 			Request:   request,
 		},
 	)
 	return err
 }
 
-func (c *Client) SendAppResponse(nodeID ids.ShortID, requestID uint32, response []byte) error {
+func (c *Client) SendAppResponse(nodeID ids.NodeID, requestID uint32, response []byte) error {
 	_, err := c.client.SendAppResponse(
 		context.Background(),
-		&appsenderproto.SendAppResponseMsg{
-			NodeID:    nodeID[:],
-			RequestID: requestID,
+		&appsenderpb.SendAppResponseMsg{
+			NodeId:    nodeID[:],
+			RequestId: requestID,
 			Response:  response,
 		},
 	)
@@ -56,14 +57,14 @@ func (c *Client) SendAppResponse(nodeID ids.ShortID, requestID uint32, response 
 func (c *Client) SendAppGossip(msg []byte) error {
 	_, err := c.client.SendAppGossip(
 		context.Background(),
-		&appsenderproto.SendAppGossipMsg{
+		&appsenderpb.SendAppGossipMsg{
 			Msg: msg,
 		},
 	)
 	return err
 }
 
-func (c *Client) SendAppGossipSpecific(nodeIDs ids.ShortSet, msg []byte) error {
+func (c *Client) SendAppGossipSpecific(nodeIDs ids.NodeIDSet, msg []byte) error {
 	nodeIDsBytes := make([][]byte, nodeIDs.Len())
 	i := 0
 	for nodeID := range nodeIDs {
@@ -73,8 +74,8 @@ func (c *Client) SendAppGossipSpecific(nodeIDs ids.ShortSet, msg []byte) error {
 	}
 	_, err := c.client.SendAppGossipSpecific(
 		context.Background(),
-		&appsenderproto.SendAppGossipSpecificMsg{
-			NodeIDs: nodeIDsBytes,
+		&appsenderpb.SendAppGossipSpecificMsg{
+			NodeIds: nodeIDsBytes,
 			Msg:     msg,
 		},
 	)

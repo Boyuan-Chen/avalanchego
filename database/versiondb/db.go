@@ -20,9 +20,17 @@ const (
 
 var (
 	_ database.Database = &Database{}
+	_ Commitable        = &Database{}
 	_ database.Batch    = &batch{}
 	_ database.Iterator = &iterator{}
 )
+
+// Commitable defines the interface that specifies that something may be
+// committed.
+type Commitable interface {
+	// Commit writes all the queued operations to the underlying data structure.
+	Commit() error
+}
 
 // Database implements the Database interface by living on top of another
 // database, writing changes to the underlying database only when commit is
@@ -39,7 +47,7 @@ type valueDelete struct {
 	delete bool
 }
 
-// New returns a new prefixed database
+// New returns a new versioned database
 func New(db database.Database) *Database {
 	return &Database{
 		mem:   make(map[string]valueDelete, memdb.DefaultSize),
@@ -48,7 +56,6 @@ func New(db database.Database) *Database {
 	}
 }
 
-// Has implements the database.Database interface
 func (db *Database) Has(key []byte) (bool, error) {
 	db.lock.RLock()
 	defer db.lock.RUnlock()
@@ -62,7 +69,6 @@ func (db *Database) Has(key []byte) (bool, error) {
 	return db.db.Has(key)
 }
 
-// Get implements the database.Database interface
 func (db *Database) Get(key []byte) ([]byte, error) {
 	db.lock.RLock()
 	defer db.lock.RUnlock()
@@ -79,7 +85,6 @@ func (db *Database) Get(key []byte) ([]byte, error) {
 	return db.db.Get(key)
 }
 
-// Put implements the database.Database interface
 func (db *Database) Put(key, value []byte) error {
 	db.lock.Lock()
 	defer db.lock.Unlock()
@@ -91,7 +96,6 @@ func (db *Database) Put(key, value []byte) error {
 	return nil
 }
 
-// Delete implements the database.Database interface
 func (db *Database) Delete(key []byte) error {
 	db.lock.Lock()
 	defer db.lock.Unlock()
@@ -103,25 +107,20 @@ func (db *Database) Delete(key []byte) error {
 	return nil
 }
 
-// NewBatch implements the database.Database interface
 func (db *Database) NewBatch() database.Batch { return &batch{db: db} }
 
-// NewIterator implements the database.Database interface
 func (db *Database) NewIterator() database.Iterator {
 	return db.NewIteratorWithStartAndPrefix(nil, nil)
 }
 
-// NewIteratorWithStart implements the database.Database interface
 func (db *Database) NewIteratorWithStart(start []byte) database.Iterator {
 	return db.NewIteratorWithStartAndPrefix(start, nil)
 }
 
-// NewIteratorWithPrefix implements the database.Database interface
 func (db *Database) NewIteratorWithPrefix(prefix []byte) database.Iterator {
 	return db.NewIteratorWithStartAndPrefix(nil, prefix)
 }
 
-// NewIteratorWithStartAndPrefix implements the database.Database interface
 func (db *Database) NewIteratorWithStartAndPrefix(start, prefix []byte) database.Iterator {
 	db.lock.RLock()
 	defer db.lock.RUnlock()
@@ -145,24 +144,13 @@ func (db *Database) NewIteratorWithStartAndPrefix(start, prefix []byte) database
 	}
 
 	return &iterator{
+		db:       db,
 		Iterator: db.db.NewIteratorWithStartAndPrefix(start, prefix),
 		keys:     keys,
 		values:   values,
 	}
 }
 
-// Stat implements the database.Database interface
-func (db *Database) Stat(stat string) (string, error) {
-	db.lock.RLock()
-	defer db.lock.RUnlock()
-
-	if db.mem == nil {
-		return "", database.ErrClosed
-	}
-	return db.db.Stat(stat)
-}
-
-// Compact implements the database.Database interface
 func (db *Database) Compact(start, limit []byte) error {
 	db.lock.Lock()
 	defer db.lock.Unlock()
@@ -264,7 +252,6 @@ func (db *Database) commitBatch() (database.Batch, error) {
 	return db.batch, nil
 }
 
-// Close implements the database.Database interface
 func (db *Database) Close() error {
 	db.lock.Lock()
 	defer db.lock.Unlock()
@@ -276,6 +263,23 @@ func (db *Database) Close() error {
 	db.mem = nil
 	db.db = nil
 	return nil
+}
+
+func (db *Database) isClosed() bool {
+	db.lock.RLock()
+	defer db.lock.RUnlock()
+
+	return db.db == nil
+}
+
+func (db *Database) HealthCheck() (interface{}, error) {
+	db.lock.RLock()
+	defer db.lock.RUnlock()
+
+	if db.mem == nil {
+		return nil, database.ErrClosed
+	}
+	return db.db.HealthCheck()
 }
 
 type keyValue struct {
@@ -290,24 +294,20 @@ type batch struct {
 	size   int
 }
 
-// Put implements the Database interface
 func (b *batch) Put(key, value []byte) error {
 	b.writes = append(b.writes, keyValue{utils.CopyBytes(key), utils.CopyBytes(value), false})
 	b.size += len(key) + len(value)
 	return nil
 }
 
-// Delete implements the Database interface
 func (b *batch) Delete(key []byte) error {
 	b.writes = append(b.writes, keyValue{utils.CopyBytes(key), nil, true})
 	b.size += len(key)
 	return nil
 }
 
-// Size implements the Database interface
 func (b *batch) Size() int { return b.size }
 
-// Write implements the Database interface
 func (b *batch) Write() error {
 	b.db.lock.Lock()
 	defer b.db.lock.Unlock()
@@ -325,7 +325,6 @@ func (b *batch) Write() error {
 	return nil
 }
 
-// Reset implements the Database interface
 func (b *batch) Reset() {
 	if cap(b.writes) > len(b.writes)*database.MaxExcessCapacityFactor {
 		b.writes = make([]keyValue, 0, cap(b.writes)/database.CapacityReductionFactor)
@@ -335,7 +334,6 @@ func (b *batch) Reset() {
 	b.size = 0
 }
 
-// Replay implements the Database interface
 func (b *batch) Replay(w database.KeyValueWriterDeleter) error {
 	for _, kv := range b.writes {
 		if kv.delete {
@@ -355,9 +353,11 @@ func (b *batch) Inner() database.Batch { return b }
 // iterator walks over both the in memory database and the underlying database
 // at the same time.
 type iterator struct {
+	db *Database
 	database.Iterator
 
 	key, value []byte
+	err        error
 
 	keys   []string
 	values []valueDelete
@@ -369,6 +369,14 @@ type iterator struct {
 // iterator is exhausted. We must pay careful attention to set the proper values
 // based on if the in memory db or the underlying db should be read next
 func (it *iterator) Next() bool {
+	// Short-circuit and set an error if the underlying database has been closed.
+	if it.db.isClosed() {
+		it.key = nil
+		it.value = nil
+		it.err = database.ErrClosed
+		return false
+	}
+
 	if !it.initialized {
 		it.exhausted = !it.Iterator.Next()
 		it.initialized = true
@@ -384,7 +392,9 @@ func (it *iterator) Next() bool {
 			nextKey := it.keys[0]
 			nextValue := it.values[0]
 
+			it.keys[0] = ""
 			it.keys = it.keys[1:]
+			it.values[0].value = nil
 			it.values = it.values[1:]
 
 			if !nextValue.delete {
@@ -406,7 +416,9 @@ func (it *iterator) Next() bool {
 			dbStringKey := string(dbKey)
 			switch {
 			case memKey < dbStringKey:
+				it.keys[0] = ""
 				it.keys = it.keys[1:]
+				it.values[0].value = nil
 				it.values = it.values[1:]
 
 				if !memValue.delete {
@@ -420,7 +432,9 @@ func (it *iterator) Next() bool {
 				it.exhausted = !it.Iterator.Next()
 				return true
 			default:
+				it.keys[0] = ""
 				it.keys = it.keys[1:]
+				it.values[0].value = nil
 				it.values = it.values[1:]
 				it.exhausted = !it.Iterator.Next()
 
@@ -434,13 +448,17 @@ func (it *iterator) Next() bool {
 	}
 }
 
-// Key implements the Iterator interface
+func (it *iterator) Error() error {
+	if it.err != nil {
+		return it.err
+	}
+	return it.Iterator.Error()
+}
+
 func (it *iterator) Key() []byte { return it.key }
 
-// Value implements the Iterator interface
 func (it *iterator) Value() []byte { return it.value }
 
-// Release implements the Iterator interface
 func (it *iterator) Release() {
 	it.key = nil
 	it.value = nil

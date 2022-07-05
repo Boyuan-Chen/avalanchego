@@ -131,6 +131,17 @@ func GetBool(db KeyValueReader, key []byte) (bool, error) {
 	return b[0] == 1, nil
 }
 
+func Count(db Iteratee) (int, error) {
+	iterator := db.NewIterator()
+	defer iterator.Release()
+
+	count := 0
+	for iterator.Next() {
+		count++
+	}
+	return count, iterator.Error()
+}
+
 func Size(db Iteratee) (int, error) {
 	iterator := db.NewIterator()
 	defer iterator.Release()
@@ -140,6 +151,13 @@ func Size(db Iteratee) (int, error) {
 		size += len(iterator.Key()) + len(iterator.Value()) + kvPairOverhead
 	}
 	return size, iterator.Error()
+}
+
+func IsEmpty(db Iteratee) (bool, error) {
+	iterator := db.NewIterator()
+	defer iterator.Release()
+
+	return !iterator.Next(), iterator.Error()
 }
 
 func Clear(readerDB Iteratee, deleterDB KeyValueDeleter) error {
